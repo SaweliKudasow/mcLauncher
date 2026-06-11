@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Простой офлайн-лаунчер Minecraft 1.8.9."""
 
+import argparse
 import hashlib
 import json
 import os
@@ -11,10 +12,13 @@ import sys
 import uuid
 import zipfile
 from pathlib import Path
+from typing import Callable
 from urllib.request import urlopen
 
 VERSION = "1.8.9"
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+
+ProgressCallback = Callable[[str, float | None], None]
 
 
 def mc_dir() -> Path:
@@ -26,19 +30,29 @@ def mc_dir() -> Path:
     return home / ".minecraft"
 
 
+def config_dir() -> Path:
+    return Path(__file__).resolve().parent / ".launcher"
+
+
 def os_name() -> str:
     return {"Windows": "windows", "Darwin": "osx", "Linux": "linux"}.get(platform.system(), "linux")
 
 
-def download(url: str, dest: Path, sha1: str | None = None) -> None:
+def download(
+    url: str,
+    dest: Path,
+    sha1: str | None = None,
+    on_progress: ProgressCallback | None = None,
+) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and (sha1 is None or file_sha1(dest) == sha1):
         return
-    print(f"  скачиваю {dest.name}...")
+    if on_progress:
+        on_progress(f"Скачиваю {dest.name}...", None)
     with urlopen(url) as resp:
         data = resp.read()
     if sha1 and hashlib.sha1(data).hexdigest() != sha1:
-        raise RuntimeError(f"неверная контрольная сумма: {dest.name}")
+        raise RuntimeError(f"Неверная контрольная сумма: {dest.name}")
     dest.write_bytes(data)
 
 
@@ -98,8 +112,9 @@ def extract_natives(jar: Path, dest: Path, exclude: list[str] | None = None) -> 
             target.write_bytes(zf.read(name))
 
 
-def get_version_json() -> dict:
-    print("получаю манифест версий...")
+def get_version_json(on_progress: ProgressCallback | None = None) -> dict:
+    if on_progress:
+        on_progress("Получаю манифест версий...", 0.05)
     with urlopen(MANIFEST_URL) as resp:
         manifest = json.load(resp)
     version_url = next(v["url"] for v in manifest["versions"] if v["id"] == VERSION)
@@ -107,29 +122,38 @@ def get_version_json() -> dict:
         return json.load(resp)
 
 
-def prepare(version: dict, root: Path) -> tuple[Path, list[Path]]:
+def prepare(
+    version: dict,
+    root: Path,
+    on_progress: ProgressCallback | None = None,
+) -> tuple[Path, list[Path]]:
+    def report(msg: str, pct: float | None = None) -> None:
+        if on_progress:
+            on_progress(msg, pct)
+
     version_dir = root / "versions" / VERSION
     version_dir.mkdir(parents=True, exist_ok=True)
     (version_dir / f"{VERSION}.json").write_text(json.dumps(version, indent=2))
 
+    report("Скачиваю клиент...", 0.1)
     client = version["downloads"]["client"]
     client_jar = version_dir / f"{VERSION}.jar"
-    download(client["url"], client_jar, client.get("sha1"))
+    download(client["url"], client_jar, client.get("sha1"), on_progress)
 
     libs_dir = root / "libraries"
     classpath: list[Path] = []
     native_jars: list[tuple[Path, list[str]]] = []
 
-    print("скачиваю библиотеки...")
-    for lib in version["libraries"]:
-        if not library_allowed(lib.get("rules")):
-            continue
+    allowed_libs = [lib for lib in version["libraries"] if library_allowed(lib.get("rules"))]
+    total_libs = max(len(allowed_libs), 1)
 
+    report("Скачиваю библиотеки...", 0.15)
+    for i, lib in enumerate(allowed_libs):
         downloads = lib.get("downloads", {})
         artifact = downloads.get("artifact")
         if artifact:
             path = libs_dir / artifact["path"]
-            download(artifact["url"], path, artifact.get("sha1"))
+            download(artifact["url"], path, artifact.get("sha1"), on_progress)
             classpath.append(path)
 
         classifier = resolve_native_classifier(lib)
@@ -137,8 +161,10 @@ def prepare(version: dict, root: Path) -> tuple[Path, list[Path]]:
             native = downloads.get("classifiers", {}).get(classifier)
             if native:
                 path = libs_dir / native["path"]
-                download(native["url"], path, native.get("sha1"))
+                download(native["url"], path, native.get("sha1"), on_progress)
                 native_jars.append((path, lib.get("extract", {}).get("exclude", [])))
+
+        report(f"Библиотеки: {i + 1}/{total_libs}", 0.15 + 0.25 * (i + 1) / total_libs)
 
     classpath.append(client_jar)
 
@@ -146,38 +172,60 @@ def prepare(version: dict, root: Path) -> tuple[Path, list[Path]]:
     if natives_dir.exists():
         shutil.rmtree(natives_dir)
     natives_dir.mkdir()
-    print("распаковываю natives...")
+    report("Распаковываю natives...", 0.45)
     for jar, exclude in native_jars:
         extract_natives(jar, natives_dir, exclude)
 
     assets_dir = root / "assets"
     asset_index = version["assetIndex"]
     index_path = assets_dir / "indexes" / f"{asset_index['id']}.json"
-    download(asset_index["url"], index_path, asset_index.get("sha1"))
+    download(asset_index["url"], index_path, asset_index.get("sha1"), on_progress)
 
-    print("скачиваю ресурсы (это может занять время)...")
+    report("Скачиваю ресурсы...", 0.5)
     index = json.loads(index_path.read_text())
     objects_dir = assets_dir / "objects"
-    for obj in index["objects"].values():
+    objects = list(index["objects"].values())
+    total_assets = max(len(objects), 1)
+    downloaded = 0
+
+    for obj in objects:
         h = obj["hash"]
         dest = objects_dir / h[:2] / h
-        if dest.exists():
-            continue
-        download(f"https://resources.download.minecraft.net/{h[:2]}/{h}", dest, h)
+        if not dest.exists():
+            download(f"https://resources.download.minecraft.net/{h[:2]}/{h}", dest, h, on_progress)
+        downloaded += 1
+        if downloaded % 50 == 0 or downloaded == total_assets:
+            report(
+                f"Ресурсы: {downloaded}/{total_assets}",
+                0.5 + 0.45 * downloaded / total_assets,
+            )
 
+    report("Подготовка завершена", 1.0)
     return natives_dir, classpath
 
 
-def launch(username: str, root: Path, natives_dir: Path, classpath: list[Path], version: dict) -> None:
-    java = shutil.which("java")
+def find_java() -> str | None:
+    return shutil.which("java")
+
+
+def launch(
+    username: str,
+    root: Path,
+    natives_dir: Path,
+    classpath: list[Path],
+    version: dict,
+    memory_gb: int = 2,
+    wait: bool = False,
+) -> subprocess.Popen | None:
+    java = find_java()
     if not java:
-        sys.exit("Java не найдена. Установите JDK 8.")
+        raise RuntimeError("Java не найдена. Установите JDK 8.")
 
     cp = os.pathsep.join(str(p) for p in classpath)
     args = [
         java,
         f"-Djava.library.path={natives_dir}",
-        "-Xmx2G",
+        f"-Xmx{memory_gb}G",
         "-cp",
         cp,
         version["mainClass"],
@@ -192,16 +240,54 @@ def launch(username: str, root: Path, natives_dir: Path, classpath: list[Path], 
         "--userType", "legacy",
     ]
 
-    print(f"\nзапускаю Minecraft {VERSION} для {username}...\n")
-    subprocess.run(args, cwd=root)
+    if wait:
+        subprocess.run(args, cwd=root)
+        return None
+    return subprocess.Popen(args, cwd=root)
+
+
+def load_settings() -> dict:
+    path = config_dir() / "settings.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"username": "Player", "memory_gb": 2}
+
+
+def save_settings(username: str, memory_gb: int) -> None:
+    config_dir().mkdir(parents=True, exist_ok=True)
+    path = config_dir() / "settings.json"
+    path.write_text(
+        json.dumps({"username": username, "memory_gb": memory_gb}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def run_cli(username: str, memory_gb: int = 2) -> None:
+    root = mc_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    print(f"Папка Minecraft: {root}")
+    version = get_version_json()
+    natives_dir, classpath = prepare(version, root)
+    print(f"\nЗапускаю Minecraft {VERSION} для {username}...\n")
+    launch(username, root, natives_dir, classpath, version, memory_gb, wait=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Офлайн-лаунчер Minecraft 1.8.9")
+    parser.add_argument("username", nargs="?", help="Имя игрока (только CLI)")
+    parser.add_argument("--cli", action="store_true", help="Запуск в консольном режиме")
+    parser.add_argument("--memory", type=int, default=2, help="ОЗУ в ГБ (по умолчанию 2)")
+    args = parser.parse_args()
+
+    if args.cli or args.username:
+        run_cli(args.username or "Player", args.memory)
+    else:
+        from gui import main as gui_main
+        gui_main()
 
 
 if __name__ == "__main__":
-    username = sys.argv[1] if len(sys.argv) > 1 else "Player"
-    root = mc_dir()
-    root.mkdir(parents=True, exist_ok=True)
-
-    print(f"папка Minecraft: {root}")
-    version = get_version_json()
-    natives_dir, classpath = prepare(version, root)
-    launch(username, root, natives_dir, classpath, version)
+    main()
