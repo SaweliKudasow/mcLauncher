@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Простой офлайн-лаунчер Minecraft 1.8.9."""
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -12,13 +14,13 @@ import sys
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 from urllib.request import urlopen
 
 VERSION = "1.8.9"
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 
-ProgressCallback = Callable[[str, float | None], None]
+ProgressCallback = Callable[[str, Optional[float]], None]
 
 
 def mc_dir() -> Path:
